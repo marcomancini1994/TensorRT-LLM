@@ -144,6 +144,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     auto const batchIdx = static_cast<SizeType32>(blockIdx.x);
     auto const tokenIdx = static_cast<SizeType32>(blockIdx.y);
     auto const batchSlot = batchSlots == nullptr ? batchIdx : batchSlots[batchIdx];
+    
     FinishedState const finishState = finishedInput != nullptr ? finishedInput[batchSlot] : FinishedState::empty();
     if ((skipDecode != nullptr && skipDecode[batchSlot]) || (finishState.isSkipDecoding()))
     {
@@ -168,12 +169,19 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
     __shared__ typename BlockReduce::TempStorage tempStorage;
     extern __shared__ char array[];
     __shared__ float sSum;
+    __shared__ float sMaxLogit;
+    
     T* sVal = topKTmpValBuf + (batchIdx * maxTokensPerStep + tokenIdx) * stride;
     auto* sId = reinterpret_cast<SizeType32*>(array);
+    auto* sLogits = reinterpret_cast<float*>(sId + k);        // Store selected logits
+    auto* sProbs = reinterpret_cast<float*>(sLogits + k);     // Store computed probabilities
+    
     if (tid == 0)
     {
         sSum = 0.0f;
+        sMaxLogit = -MAX_T_VAL;
     }
+    
     TopK_2<float> partial;
 
     if (finishState.isFinished())
@@ -185,8 +193,7 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
         return;
     }
 
-    auto sVal2 = reinterpret_cast<float*>(sId + k);
-    float maxLogit;
+    // Phase 1: Select top-K indices and find max logit for numerical stability
     for (SizeType32 ite = 0; ite < k; ite++)
     {
         partial.init();
@@ -200,86 +207,105 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
 
         if (tid == 0)
         {
-            if (ite == 0)
-            {
-                maxLogit = total.u;
-            }
             sId[ite] = total.p;
+            sLogits[ite] = total.u;
             sVal[total.p] = -MAX_T_VAL;
-
-            // when cumLogProbs are computed, topKTmpValBuf (logits_buf_) are
-            // already pre-processed by softmax_kernel
-            if (!logitHasProbs)
+            
+            // Track max logit for numerical stability
+            if (total.u > sMaxLogit)
             {
-                total.u = __expf(total.u - maxLogit);
+                sMaxLogit = total.u;
             }
-            sVal2[ite] = total.u;
-            sSum += total.u;
         }
         __syncthreads();
     }
 
+    // Phase 2: Compute probabilities only for selected top-K tokens
     if (tid == 0)
     {
-        // if we want to return all top k indices, we should not do random sampling for probThreshold
+        // Convert selected logits to probabilities
+        for (SizeType32 i = 0; i < k; i++)
+        {
+            if (!logitHasProbs)
+            {
+                // Apply softmax only to selected tokens: exp(logit - max_logit)
+                sProbs[i] = __expf(sLogits[i] - sMaxLogit);
+            }
+            else
+            {
+                // Logits are already probabilities
+                sProbs[i] = sLogits[i];
+            }
+            sSum += sProbs[i];
+        }
+        
+        // Normalize probabilities
+        for (SizeType32 i = 0; i < k; i++)
+        {
+            sProbs[i] /= sSum;
+        }
+    }
+    __syncthreads();
+
+    // Phase 3: Sampling and output generation
+    if (tid == 0)
+    {
         auto randNum = (returnAllSelectedTokens || curandState == nullptr)
             ? static_cast<float>(probThreshold * sSum)
             : static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum);
-        // when a token must still be multinomial sampled when returnAllSelectedTokens == True.
         auto randNum2 = sampleTokenInSelected
             ? static_cast<float>(curand_uniform(curandState + batchSlot) * probThreshold * sSum)
             : 0.0f;
+            
         auto* outputIdsRequestPtr = idsPtrs == nullptr ? ids + batchSlot * maxSeqLen : idsPtrs[batchSlot];
+        
+        float cumProb = 0.0f;
         for (SizeType32 ki = 0; ki < k; ki++)
         {
-            auto expLogit = sVal2[ki];
-            randNum = randNum - expLogit;
+            cumProb += sProbs[ki];
+            randNum -= sProbs[ki] * sSum; // Scale back for comparison
             if (sampleTokenInSelected)
             {
-                randNum2 = randNum2 - expLogit;
+                randNum2 -= sProbs[ki] * sSum;
             }
+            
             if (randNum <= 0.0f || ki == k - 1 || returnAllSelectedTokens)
             {
                 auto idx = sId[ki];
-                // If sId is -1 here we force output token to the last from vocabulary to get vivid indicator of smth
-                // going wrong for the debug
                 auto outputId = idx != -1
                     ? topKTmpIdBuf[(batchIdx * maxTokensPerStep + tokenIdx) * stride + idx] % vocabSize
                     : vocabSize - 1;
                 outputId = outputId == -1 ? vocabSize - 1 : outputId;
+                
                 auto const curSeqLen = sequenceLengths == nullptr ? 0 : sequenceLengths[batchSlot];
                 auto const outIdx = returnAllSelectedTokens ? tokenIdx * maxTopK + ki : curSeqLen + tokenIdx;
                 outputIdsRequestPtr[outIdx] = outputId;
 
                 if (returnAllSelectedTokens)
                 {
-                    // 'outputLogProbs' is the probability induced by the top-k sampling:
-                    // NOT normalized (same way as OpenAI does):
-                    // log_prob = log P(i | i is in vocab) = log(expLogit)
-                    // normalized:
-                    // log_prob = log P(i | i is in top-k) = log(expLogit / sum)
+                    // Directly use computed probability for output log probs
                     if (outputLogProbs != nullptr)
                     {
-                        // outputLogProbs shape: [maxBatchSize, maxTopK]
-                        auto logProb = logf(expLogit);
-                        auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
-                        outputLogProbs[batchSlot * maxTopK + ki] = normalizedProb;
+                        auto logProb = logf(sProbs[ki]);
+                        // Probability is already normalized, so we can use it directly
+                        // or apply additional normalization if needed
+                        auto const finalLogProb = normalizeLogProbs ? logProb : logProb + logf(sSum);
+                        outputLogProbs[batchSlot * maxTopK + ki] = finalLogProb;
                     }
                 }
                 else
                 {
                     if (cumLogProbs != nullptr || outputLogProbs != nullptr)
                     {
-                        auto logProb = logf(expLogit);
+                        auto logProb = logf(sProbs[ki]);
                         if (cumLogProbs != nullptr)
                         {
-                            cumLogProbs[batchSlot] += logProb;
+                            cumLogProbs[batchSlot] += normalizeLogProbs ? logProb : logProb + logf(sSum);
                         }
                         if (outputLogProbs != nullptr)
                         {
-                            auto const normalizedProb = normalizeLogProbs ? logProb - logf(sSum) : logProb;
-                            // outputLogProbs shape: [maxSeqLen, maxBatchSize]
-                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot] = normalizedProb;
+                            auto const finalLogProb = normalizeLogProbs ? logProb : logProb + logf(sSum);
+                            outputLogProbs[curSeqLen * maxBatchSize + batchSlot] = finalLogProb;
                         }
                     }
                     break;
@@ -287,7 +313,6 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
 
                 if (sampleTokenInSelected && randNum2 <= 0.0f)
                 {
-                    // record the multinomial sampled token when returnAllSelectedTokens == True.
                     randNum2 = MAX_T_VAL;
                     outputIdCurrentStep[batchSlot] = outputId;
                 }
@@ -295,26 +320,25 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
                 if (returnAllSelectedTokens && randNum <= 0.0f && strictTopPBoundary)
                 {
                     if (ki < k - 1)
-                    { // not the last k, write a -1 to to log top p tokens boundary for external draft token masking
+                    {
                         outputIdsRequestPtr[outIdx + 1] = -1;
                     }
                     break;
                 }
             }
         }
-        if (maxTokensPerStep == 1 && !returnAllSelectedTokens && sequenceLengths != nullptr && finishedOutput != nullptr
-            && endIds != nullptr)
+        
+        // Handle sequence completion
+        if (maxTokensPerStep == 1 && !returnAllSelectedTokens && sequenceLengths != nullptr 
+            && finishedOutput != nullptr && endIds != nullptr)
         {
             auto const seqLen = sequenceLengths[batchSlot];
             if (outputIdsRequestPtr[seqLen] == endIds[batchSlot])
             {
                 finishedOutput[batchSlot].setFinishedEOS();
-                // Do not increase seq len when EOS is generated. Seq len should always contain only tokens to be
-                // outputted
             }
             else
             {
-                // We don't need to set output finished state as it is assumed to be in non finished state
                 sequenceLengths[batchSlot] += 1;
             }
         }
@@ -335,8 +359,10 @@ __global__ void topKStage2Sampling(SizeType32 const* __restrict topKTmpIdBuf, T*
         {                                                                                                              \
             dim3 grid(params.batchSize, params.maxTokensPerStep);                                                      \
             dim3 block(BLOCK_SIZE_2_);                                                                                 \
-            topKStage2Sampling<T, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_>                                                     \
-                <<<grid, block, K_MAX * sizeof(SizeType32) + K_MAX * sizeof(float), stream>>>(topKTmpIdBuf,            \
+            /* Increased shared memory: K_MAX indices + K_MAX logits + K_MAX probabilities */                         \
+            size_t sharedMem = K_MAX * (sizeof(SizeType32) + 2 * sizeof(float));                                      \
+            topKStage2Sampling<T, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_>                                            \
+                <<<grid, block, sharedMem, stream>>>(topKTmpIdBuf,                                                     \
                     topKTmpValBuf, params.outputIdsPtrs, params.outputIds, params.sequenceLengths,                     \
                     params.finishedInput, params.finishedOutput, params.cumLogProbs, params.outputLogProbs,            \
                     params.maxTopK, params.topKs, params.maxTopP, params.topPs, params.curandState, params.endIds,     \
